@@ -1,0 +1,36 @@
+---
+title: "Vignette Title"
+author: "Vignette Author"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r}
+library(CellNOptR)
+library(dplyr)
+data_file <- system.file("extdata/datasets", "MD-TCellPCB2007.csv",
+                         package = "artemis")
+model_file <- system.file("extdata/models", "PKN-TCellPCB2007.sif", 
+            package = "artemis")
+tcell_data <- CNOlist(data_file)
+tcell_model <- readSIF(model_file)
+preprocessing(tcell_data, tcell_model, expansion = FALSE) %>%
+  plotModel(tcell_data)
+```
+
+The following is a model that blends a [T-cell signaling prior knowledge network](http://www.ebi.ac.uk/~cokelaer/cellnopt/data/) and a [single cell AML study](http://www.cytobank.org/nolanlab/reports/Levine2015.html).  The data is not real, but engineered such that it shows the overlap between the model and the data set.  Not the pi3K -- Akt edge was added to the original sif representaion of the model so akt could be included.
+
+```{r}
+data_file <- system.file("extdata/datasets", "TCell_fake.csv",
+                         package = "artemis")
+model_file <- system.file("extdata/models", "TCellConstructed.sif", 
+            package = "artemis")
+tcell_data <- CNOlist(data_file)
+tcell_model <- readSIF(model_file)
+preprocessing(tcell_data, tcell_model, expansion = FALSE) %>%
+  plotModel(tcell_data)
+```

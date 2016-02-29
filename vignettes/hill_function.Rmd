@@ -1,0 +1,60 @@
+---
+title: "Vignette Title"
+author: "Vignette Author"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+
+
+
+```{r}
+library(artemis)
+library(dplyr)
+```
+
+### Dynamic modeling of signaling pathways 
+
+In the biomodeling literature, a good dynamic model of signal transduction is judged by how well it describes keep mechanisms in the system, such as feedback loops and hysteresis.  The goal is to build a model with as few species and simple dynamics as possible while still capturing the key behaviours.  Various approaches are used to capture the dynamics of the models, such as ODEs, SDEs, PDEs, Boolean logic, and Petri nets.  Building the model is an iterative process relying on experiments using different and typically low throughput measurement platforms. Data from these experiments is used to estimate the rate laws in the models, with methods ranging from least-squares to MCMC.
+
+### Dynamic models and high-throughput data
+
+A alternate challenge is to make context-specific models of signaling.  For example, given signaling data from a patient with a certain disease, the model could predict outcome of treatment.  Here, prior knowledge in the form of a network of species and reactions from sources such as KEGG, provide the structure of a predictive model.  Since the prior knowledge network almost never contains quantitative information, so model parameters are estimated using from high-throughput proteomics data.
+
+The challenge here is to construct the predictive model in such a way that the model's parameters have some biological interpretation within the context of the prior knowledge network.  Estimating these types of parameters enables not only prediction, but some insight into the biology underlying the conditions where the data was collected.  Without this interpretation, there is no reason not to ignore prior knowledge and use a descriminitive model such as a neural network or SVM, where interpreting parameters does not matter. 
+
+Since the prior knowledge network describes species and reactions, a logical parameterization would be the parameters of rate laws, using kinetic functions common for dynamic models in systems biology (eg. mass action or Hilton-Michaelis-Menten kinetics).  However, the nature of proteomics data makes estimation of these types of rates infeasible in most cases for a few reasons.  
+
+* Prior knowledge networks tend to be large sets of species and reactions, meaning the number of rate parameters becomes quite large if the kinetic assumptions are too complex.
+* Proteomics experiments typically quantify some but not all components of the prior knowledge networks at once.  
+* The proteomics timecourse data is only available in "snapshots", i.e. timecourses for a single replicate are not available.
+
+Thus the kinetic assumptions and rate parameters used to build a predictive model from a prior knowledge signaling network is limited by these constraints.  The challenge is finding a modeling formulation that matches prior knowledge to the type of data available, and of course making sure that the model still predicts well.
+
+## One possibility
+
+Prior knowledge network:
+![toy model](http://i.imgur.com/i5EYvjW.png?1)]
+
+For an edge A -> B, a black edge means A activates B (dB/dt increases when A increases), and a red edge means A inhibits B (dB/dt decreases when A increases).  AND nodes mean the combined effect of all the parents is required to have the effect on the child.  In this case dPI3K/dt increases given a combined signal from TNFA, TGFA, and RAS, but not independent signals -- if any of those nodes have a value of 0, there is no effect on dPI3K/dt.  Similarly TFGA and ERK12 have a combine to activate RAS -- in this case the inhibitory edge from ERK12 to the AND node means a decrease in ERK12 and an increase in TGFA will cause an increase in dRAS/dt.
+
+The data:
+
+```{r}
+data(toy_data)
+str(toy_data)
+```
+
+The first 7 variables correspond to observed proteins Akt, Hspb27, NFkB, Erk, p90RSK, Jnk, cJun.  Note Mek12 is not covered in the data. The 8th and 9th variable correspond to stimulations, one on EGF (the TFGA node) and one on TNFa.  These stimulation values are either 1 or 0, and when they are 1, the signal cascades through the network.  The next two variables represent exogenous inhibitions -- perturbations that block signal at these nodes by preventing them from activating downstream nodes.  Finally, the last variable is timepoint; a factor with two levels t0 and t10.  The data is in tidy format.  At t0 all the protein values are at 0 and stimulations and inhibitions are applied.  Protein measurements are collected at t10.
+
+## The kinetics
+
+Note the protein concentrations in the data are normalized to {0, 1}, assume this is a constraint of the model described below.
+
+$$   \left ( 1- \frac{Akt^{n_1} /(k_1^{n_1}+Akt^{n_1})}{1/(k_1^{n_1})} \right )
+\left ( \frac{Raf^{n_2} /(k_2^{n_2}+Akt^{n_2})}{1/(k_2^{n_2}+1)} \right ) \tau $$
+
