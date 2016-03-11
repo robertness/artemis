@@ -34,3 +34,5 @@ tcell_model <- readSIF(model_file)
 preprocessing(tcell_data, tcell_model, expansion = FALSE) %>%
   plotModel(tcell_data)
 ```
+
+Now working with the 
