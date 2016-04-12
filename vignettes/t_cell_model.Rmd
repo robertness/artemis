@@ -35,4 +35,15 @@ preprocessing(tcell_data, tcell_model, expansion = FALSE) %>%
   plotModel(tcell_data)
 ```
 
-Now working with the 
+Now working with the hepatocellular carcinoma cells discussed in Saez-Rodriguez, Lauffenburger, Klamt and Sorger *et al*'s 2009 paper on logic modeling of signaling networks.
+
+```{r}
+data_file <- system.file("extdata/datasets", "MD-ExtLiverPCB1.csv",
+                         package = "artemis")
+model_file <- system.file("extdata/models", "PKN-ExtLiverPCB.sif", 
+            package = "artemis")
+tcell_data <- CNOlist(data_file)
+tcell_model <- readSIF(model_file)
+preprocessing(tcell_data, tcell_model, expansion = FALSE) %>%
+  plotModel(tcell_data)
+```

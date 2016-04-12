@@ -2,9 +2,12 @@ library(CNORode)
 library(magrittr)
 library(dplyr)
 library(stringr)
-data(ToyModel)
-data(CNOlistToy)
-cnolist <- CNOlist(CNOlistToy)
+data_file <- system.file("extdata/datasets", "MD-ToyMMB.csv",
+                         package = "artemis")
+model_file <- system.file("extdata/models", "PKN-ToyMMB.sif", 
+                          package = "artemis")
+cnolist <- CNOlist(data_file)
+model <- readSIF(model_file)
 plotModel(model, cnolist)
 # Pruning
 toy_data <- CNOlistToy$valueSignals %>%

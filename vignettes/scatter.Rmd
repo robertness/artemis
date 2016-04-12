@@ -1,0 +1,400 @@
+---
+title: "Visualizing Scatterplots in CellNOptR"
+author: "Robert Ness"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r}
+library(artemis)
+library(bninfo)
+library(tidyr)
+library(dplyr)
+library(magrittr)
+library(parallel)
+```
+
+What are the pairwise relationships between the features in the type of data that CellNOpt works with?
+
+Here is what the model looks like:
+
+```{r}
+data_file <- system.file("extdata/datasets", "MD-ToyMMB.csv",
+                         package = "artemis")
+model_file <- system.file("extdata/models", "PKN-ToyMMB.sif", 
+                          package = "artemis")
+cnolist <- CNOlist(data_file)
+model <- readSIF(model_file)
+plotModel(model, cnolist)
+```
+
+There are 9 conditions at the 10th time point.  Can I see the correlations across conditions?
+
+
+```{r}
+data(toy_data)
+plot_data <- toy_data %>%
+  filter(timepoint == "t10") %>%
+  select(Akt, Hsp27, NFkB, Erk, p90RSK, Jnk, cJun, stim_TNFa, stim_EGF)
+with(plot_data,{
+  plot(stim_TNFa, Jnk, xlim = c(0, 1), ylim = c(0, 1), sub = "Expect Activation")
+  plot(Jnk, cJun, xlim = c(0, 1), ylim = c(0, 1), sub = "Expect Activation")
+  plot(stim_TNFa, NFkB, xlim = c(0, 1), ylim = c(0, 1))
+  plot(stim_TNFa, Akt, xlim = c(0, 1), ylim = c(0, 1), sub = "Expect Activation")
+  plot(Akt, Erk, xlim = c(0, 1), ylim = c(0, 1), sub = "Expect Inhibition")
+  plot(Akt, p90RSK, xlim = c(0, 1), ylim = c(0, 1), sub = "Expect Inhibition")
+  plot(Erk, Hsp27, xlim = c(0, 1), ylim = c(0, 1), sub = "Expect Activation")
+})
+```
+
+For the most immediately downstream regulations, the plots look as I expect.  Further down, two way plots fail me.
+
+I will try some preliminary Bayesian Network modeling and see how well I might reconstruction the network.  With few parameters I try a logistic transform and model with a Gaussian.  I will also blacklist any incoming edges to the receptors, for some basic direction coersion.
+
+```{r}
+library(bnlearn)
+nodes <- c("Akt", "Hsp27", "NFkB", "Erk", "p90RSK", "Jnk", "cJun", "stim_TNFa", "stim_EGF")
+receptors <- c("stim_TNFa", "stim_EGF")
+bl <- rbind(cbind(setdiff(nodes, receptors[1]),receptors[1]),
+            cbind(setdiff(nodes, receptors[2]), receptors[2]))
+.data <- toy_data %>%
+  filter(timepoint == "t10") %>%
+  select(Akt, Hsp27, NFkB, Erk, p90RSK, Jnk, cJun, stim_TNFa, stim_EGF) %>%
+  lapply(function(item) {
+    item <- ifelse(item == 1, item - .001, item)
+    item <- ifelse(item == 0, item + .001, item)
+    log(item / (1 - item))
+  }) %>%
+  data.frame
+net <- hc(.data, blacklist = bl, score = "bic-g")
+graphviz.plot(net, shape = "rectangle")
+```
+
+Akt NFkB link is worrisome, as is lack of any links from TNFa.  Trying discretization.
+
+```{r}
+.data <- toy_data %>%
+  filter(timepoint == "t10") %>%
+  select(Akt, Hsp27, NFkB, Erk, p90RSK, Jnk, cJun, stim_TNFa, stim_EGF) %>%
+  lapply(function(item) as.ordered(item)) %>%
+  data.frame
+net <- hc(.data, blacklist = bl, score = "bic")
+graphviz.plot(net, shape = "rectangle")
+```
+
+Looks a bit better.  Now trying a bootstrap.  I expect the true edges to have stronger results.  But it doesn't matter at this point.
+
+```{r}
+boot.strength(.data, algorithm = "hc", 
+              algorithm.args = list(blacklist = bl, score = "bic"), 
+              cpdag = F) %>%
+  reduce_averaging %>%
+  filter(strength > .5)
+```
+
+Next, I do not want to deal with these missing values.  Let me simulate from the system.
+
+A few thoughts on dynamics.  It is X(t - 1) that determines Y(t).  For X(t) to proxy for X(t-1), you need steady state.  So just take the steady state with this model.
+
+```{r}
+library(CNORode)
+ode_parameters <- createLBodeContPars(model, LB_n = 1, LB_k = 0.1,
+                                      LB_tau = 0.01, UB_n = 5, UB_k = 0.9, 
+                                      UB_tau = 10, default_n = 3, default_k = 0.5, 
+                                      default_tau = 1, opt_n = TRUE, opt_k = TRUE,
+                                      opt_tau = TRUE, random = FALSE)
+model_sim <- plotLBodeModelSim(cnolist, model, ode_parameters, 
+                               timeSignals=seq(0,10,0.5)) 
+```
+
+I note that if I am working with steady state, then I am working with a logic model.  The ODE justification comes only for simulating heterogeneity, which I doubt matters if all the values just go to 0 or 1.  
+
+```{r}
+.data <- model_sim[[length(model_sim)]]  %>%
+  apply(2, round) %>%
+  data.frame %>%
+  set_names(model$namesSpecies) %>%  
+  select(-EGF, -TNFa) %>%
+  {cbind(getStimuli(cnolist), .)} %>%
+  lapply(ordered) %>%
+  data.frame
+cues <- getCues(cnolist)
+INT <- sapply(names(.data), function(item){
+  if(item %in% colnames(cues)){
+    return(which(cues[, item] == 1))
+  }
+  numeric(0)  
+})
+nodes <- names(.data)
+receptors <- c("TNFa", "EGF")
+bl <- rbind(cbind(setdiff(nodes, receptors[1]),receptors[1]),
+            cbind(setdiff(nodes, receptors[2]), receptors[2]))
+net <- hc(.data, blacklist = bl, score = "mbde", exp = INT, iss = 1)
+graphviz.plot(net, shape = "rectangle")
+```
+
+Comparing to the true network to see how I did.
+
+```{r}
+gt <- empty.graph(nodes)
+arcs(gt) <- read.table(model_file, stringsAsFactors = F)[, c(1, 3)]
+performance_plot(net, gt, plot_truth = T)
+```
+
+```{r}
+performance_plot(net, gt, plot_truth = F)
+```
+
+My objective is to do bootstrap analysis.  I refit a network with inhibition nodes.
+
+```{r}
+gt2 <- empty.graph(c(nodes, "inh_Raf", "inh_PI3K"))
+arcs(gt2) <- rbind(read.table(model_file, stringsAsFactors = F)[, c(1, 3)],
+                   c("inh_Raf", "Raf"),
+                   c("inh_PI3K", "PI3K"))
+mat <- getInhibitors(cnolist) %>%
+  set_colnames(c("inh_Raf", "inh_PI3K"))
+net <- model_sim[[length(model_sim)]]  %>%
+  apply(2, round) %>%
+  data.frame %>%
+  set_names(model$namesSpecies) %>%  
+  select(-EGF, -TNFa) %>%
+  {cbind(getStimuli(cnolist), .)} %>%
+  {cbind(mat, .)} %>%
+  lapply(ordered) %>%
+  data.frame %>%
+  {rbn(gt2, n = 10000, data = ., fit = "bayes")} %>%
+  select(-inh_Raf, -inh_PI3K) %>%
+  bn.fit(gt, data = .)
+```
+
+Note, the above Bayes fit introduces not a small amount of entropy to the CPDs.  Using mle produces essentially a Boolean network.  I can use this entropy as a source of stochasticity/cell heterogeneity, instead of stochastic simulation.
+
+I am looking for three figures:
+
+1. One that show improvement in average causal entropy after each subsequent experiment.
+2. One that shows improvement of individual edge strengths upon incorporating prior data.
+3. One that shows improvement of individual causal entropies upon incorporating prior data.
+
+To do the first, I need a proof of concept -- that interventional information does NOT improve strength, but does improve causal entropy.  To do this I simulate an ideal experiment.
+
+Does the ideal experiment out perform the rbn at simple sample size?
+
+```{r}
+cl <- makeCluster(4)
+boot_rbn <- rbn(net, 300) %>%
+  boot.strength(cluster = cl, algorithm = "tabu", cpdag = FALSE,
+                algorithm.args = list(tabu = 50, blacklist = bl, score = "bde", iss = 1)) %>%
+  reduce_averaging
+boot_fixed <- rbn_fixed(net, 10) %>%
+  boot.strength(cluster = cl, algorithm = "tabu", cpdag = FALSE,
+                algorithm.args = list(tabu = 50, blacklist = bl, score = "bde", iss = 1)) %>%
+  reduce_averaging
+plot_data <- data.frame(edges = arcs2names(boot_rbn, directed_edges = F),
+                        rbn = boot_rbn$strength,
+                        fixed = boot_fixed$strength) %>%
+  gather(set, strength, -edges) %>%
+  mutate(validation = ifelse(edges %in% arcs2names(arcs(net), 
+                                                   directed_edges = F), "T", "F"),
+         index_rbn = rep(order(order(strength[set == "rbn"])), 2),
+         index_fixed = rep(order(order(strength[set == "fixed"])), 2))
+plot_data %>%
+  filter(set == "rbn") %>%
+  ggplot(aes(x = index_rbn, y = strength, colour = validation)) +
+  geom_point() +
+  ggtitle("Dataset simulated with rbn_fixed")
+```
+
+I expect fixed to have an even steeper curve, with more separation.
+
+```{r}
+plot_data %>%
+  filter(set == "fixed") %>%
+  ggplot(aes(x = index_fixed, y = strength, colour = validation)) +
+  geom_point() +
+  ggtitle("Dataset simulated with rbn_fixed")
+```
+
+Actually, ideal data didn't seem to make an impact.  Perhaps this is because rbn already does a good job in covering the sample space.  In previous analysis, tables of the rbn indeed produce non-zero counts.
+
+My previous work showed that increasing sample size does increase TP rate, but does not have a dramatic impact on reducing FP rate.  That said, the number of proteins in that study was quite a bit more.  Let's scale this up to 300K cells.  Perhaps the blue will go up while the red stay about the same?  However, here we use a likelihood-based score instead of independence tests.  Might affect things a bit.  
+
+```{r, eval = FALSE}
+cl <- makeCluster(4)
+boot_big <- rbn(net, 300000) %>%
+  boot.strength(cluster = cl, algorithm = "tabu", cpdag = FALSE,
+                algorithm.args = list(tabu = 50, blacklist = bl, score = "bde", iss = 1)) %>%
+  reduce_averaging
+save(boot_big, file = "inst/extdata/robjects/toy_model_boot_300K.Rdata")
+```
+
+```{r}
+system.file("/extdata/robjects/toy_model_boot_300K.Rdata")
+```
+
+```{r}
+plot_data <- data.frame(edges = arcs2names(boot_rbn, directed_edges = F),
+                        small = boot_rbn$strength,
+                        big = boot_big$strength) %>%
+  gather(set, strength, -edges) %>%
+  mutate(validation = ifelse(edges %in% arcs2names(arcs(net), 
+                                                   directed_edges = F), "T", "F"),
+         index_rbn = rep(order(order(strength[set == "small"])), 2),
+         index_fixed = rep(order(order(strength[set == "big"])), 2))
+plot_data %>%
+  filter(set == "small") %>%
+  ggplot(aes(x = index_rbn, y = strength, colour = validation)) +
+  geom_point() +
+  ggtitle("Dataset simulated with 300 points")
+```
+
+
+```{r, eval=false}
+plot_data %>%
+  filter(set == "big") %>%
+  ggplot(aes(x = index_fixed, y = strength, colour = validation)) +
+  geom_point() +
+  ggtitle("Dataset simulated with 300K points")
+```
+![Imgur](http://i.imgur.com/5FhtBHu.png)
+
+So look at that, as the number of cells increases, entropy in strength decreases.  False positives go down, true positives go up.  
+
+Now I hope to see that in this case of the 300K sim, the causal entropies are still uncertain.
+
+```{r}
+plot_data <- data.frame(edges = arcs2names(boot_rbn, directed_edges = F),
+                        small = orientation_entropy(boot_rbn),
+                        big = orientation_entropy(boot_big)) %>%
+  gather(set, c_entropy, -edges) %>%
+  mutate(validation = ifelse(edges %in% arcs2names(arcs(net), directed_edges = F), "T", "F"),
+         index_small = rep(order(order(c_entropy[set == "small"])), 2),
+         index_big = rep(order(order(c_entropy[set == "big"])), 2))
+```
+
+```{r}
+plot_data %>%
+  filter(set == "small") %>%
+  ggplot(aes(x = index_big, y = c_entropy, colour = validation)) +
+  geom_point() +
+  ggtitle("Dataset simulated with 300K points")
+```
+
+This is what I expected.  The edges I care about are the ones with the most entropy.  Now in the big data case, I expect the same amount of causal entropy.
+
+```{r}
+plot_data %>%
+  filter(set == "big") %>%
+  ggplot(aes(x = index_big, y = c_entropy, colour = validation)) +
+  geom_point() +
+  ggtitle("Dataset simulated with 300K points")
+```
+
+I didn't work!  Causal entropy is near 0!  
+
+I have a theory.  These are greedy search algorithms.  Randomness is introduced only by resampling.  However, with large sample size, resampling is moot.  To test this theory, I'll repeat the simulation, and compare hamming distance each subsequent sim.  I bet I get a vector of 0s.
+
+This is kind of like a derivative of the trajectory of simulations.  First a practice sim with 300 values:
+
+```{r}
+.sim_data <- rbn(net, 300)
+nets <- lapply(1:3, function(i){
+  .resampled <- sample_n(.sim_data, nrow(.sim_data), replace = T)
+  tabu(.resampled, blacklist = bl, score = "bde", iss = 1, tabu = 50)
+  })
+change <- rep(NA, length(nets) - 1)
+for(i in 1:length(change)){
+  change[i] <- shd(nets[[i+1]], nets[[i]])
+}       
+change
+```  
+Now the real thing.  And just to be safe, I repeat with starting networks to prove that at high sample size, starting networks are insufficient to introduce variation.
+
+```{r}
+.sim_data <- rbn(net, 300000)
+nets1 <- lapply(1:10, function(i){
+  .resampled <- sample_n(.sim_data, nrow(.sim_data), replace = T)
+  tabu(.resampled, blacklist = bl, score = "bde", iss = 1, tabu = 50)
+  })
+change1 <- rep(NA, length(nets1) - 1)
+for(i in 1:length(change1)){
+  change1[i] <- shd(nets1[[i+1]], nets1[[i]])
+}       
+change1
+```
+
+All 0s as expected.  Despite resampling I always get the same network.
+
+```{r}
+bl_arcs <- apply(bl, 1, paste0, collapse = "->")
+starting_nets <- random.graph(nodes(net), 10, method = "melancon", burn.in = 100) %>%
+  lapply(function(rand_net){
+    new_net <- empty.graph(nodes(rand_net))
+    new_arcs <- rand_net %>%
+      arcs %>%
+      data.frame %>%
+      mutate(edges = arcs2names(arcs(rand_net), directed = TRUE)) %>%
+      filter(!edges %in% bl_arcs) %>%
+      select(from, to) %>%
+      as.matrix
+    arcs(new_net) <- new_arcs
+    new_net
+  })
+nets2 <- lapply(starting_nets, function(start_net){
+  .resampled <- sample_n(.sim_data, nrow(.sim_data), replace = T)
+    tabu(.resampled, blacklist = bl, start = start_net, score = "bde", iss = 1, tabu = 50)
+  })
+change2 <- rep(NA, length(nets2) - 1)
+for(i in 1:length(change2)){
+  change2[i] <- shd(nets2[[i+1]], nets2[[i]])
+}       
+change2
+```
+
+Running this give me the vector; 0 2 2 0 0 0 0 0 0. On average the starting networks had 43 arcs with a sd of 2.  The final inferred networks had an averaging of 16 arcs with very little variation.  So starting networks make a different, but not much of one. Just to make sure, I'll try ic-dag simulation.
+
+```{r}
+starting_nets <- random.graph(nodes(net), 10, method = "ic-dag", burn.in = 100) %>%
+  lapply(function(rand_net){
+    new_net <- empty.graph(nodes(rand_net))
+    new_arcs <- rand_net %>%
+      arcs %>%
+      data.frame %>%
+      mutate(edges = arcs2names(arcs(rand_net), directed = TRUE)) %>%
+      filter(!edges %in% bl_arcs) %>%
+      select(from, to) %>%
+      as.matrix
+    arcs(new_net) <- new_arcs
+    new_net
+  })
+nets3 <- lapply(starting_nets, function(start_net){
+  .resampled <- sample_n(.sim_data, nrow(.sim_data), replace = T)
+    tabu(.resampled, blacklist = bl, start = start_net, score = "bde", iss = 1, tabu = 50)
+  })
+change3 <- rep(NA, length(nets3) - 1)
+for(i in 1:length(change3)){
+  change3[i] <- shd(nets3[[i+1]], nets3[[i]])
+}       
+change3
+```
+ 
+
+This returned a vector of 0 2 2 2 4 2 0 0 0.  This time the starting networks had on average 32 arcs, again will little variation, and the inferred networks were again around 16 or 17 arcs.  This is still not much difference.  Despite using random starting nets and resampling, we do not get a wide enough sample of the posterior.
+
+How might I resolve this?  I know that with a large amount of cells, edge strength shouldn't be an issue.  So if the algorithm kept giving me the same network, the that I might acquire the CPDAG.  I can simulate a random DAG of the same equivalence class by simulating a directed edge from each undirected edge.  Only, I don't want to simulate for edges that I think were coerced by the interventions.  So clearly, I can take the inferred network in an instance, and randomly "spin" non-V-structure edges.  However, in addition to v-structure edges, I want to avoid "spinning" edges that were directly affected by an intervention.  Here is a potential algorithm.
+
+If using mbde
+
+* annotate each edges connected to targeted nodes as fixed.
+* annotate edges involved in v-structures as fixed.
+* annotate edges whose reversal would induce a new v-structure as fixed.
+* annotate all remaining edges as variable.
+
+If using intervention nodes (softer than mbde), same as before, except for step 1.  
+
+I am going to stop here.  Rather than simulating, perhaps I could use some sort of enumeration.  For example, if Mek--Erk is fixed left to right assign a 1, if right to left assign 0, if variable assign .5?  I think this is something akin to what Scutari does.  
+
