@@ -1,0 +1,412 @@
+---
+title: "L1 error and Causal Entropy for DREAM"
+author: "Robert Ness"
+date: "April 20, 2016"
+output: html_document
+---
+
+```{r, message=FALSE}
+library(CellNOptR)
+library(dplyr)
+library(tidyr)
+library(bninfo)
+library(artemis)
+library(combinat)
+library(stringr)
+```
+
+Is this analysis I use the DREAM model to implement calculation of L1 error and causal entropy over several interventions.  I do so in two cases, with canonical knowledge used as a prior and without.  The canonical knowledge is simply that if there is an edge that contains a receptor, to-receptor orientation of the edge should have near 0 probability.
+
+First I define some basic objects: 
+
+```{r}
+load(system.file("extdata/robjects", "dream_net.rda", package = "artemis"))
+node_names <- nodes(net)
+starting_nets <- random.graph(node_names, 100, method = "ic-dag", burn.in = 100) 
+receptors <- c("igf1", "il1a", "tgfa", "tnfa")
+prior_edges <-  arcs2names(arcs(net)[1:10, ], directed = F)
+
+```
+
+Step 1: Calculation of the beta prior in the case of canonical information.
+
+```{r}
+data_boot <- lapply(starting_nets, function(start_net){
+    tabu(rbn(net, 80), start = start_net, tabu = 50, 
+         prior = "cs", score = "bde", iss = 40)
+  }) %>%
+  custom.strength(nodes(net), cpdag = FALSE)
+data_prior <- mutate(data_boot, 
+                        prob = strength * direction,
+                        prob = ifelse(prob == 1, 1 - .Machine$double.eps * 100, prob ),
+                        prob = ifelse(prob == 0,  .Machine$double.eps * 100, prob)) %>%
+  select(from, to, prob)
+```
+
+Step 2: Fushion of canonical information and data to create a canonical prior.
+```{r}
+receptor_bl <- lapply(receptors,
+                      function(receptor){
+                        cbind(from = receptor, to = setdiff(receptors, receptor))
+                      }) %>%
+  {do.call("rbind", .)} %>%
+  data.frame(stringsAsFactors = F) %>%
+  mutate(prob = .Machine$double.eps * 100)
+prior_no_incoming <- lapply(receptors, 
+             function(receptor){
+               cbind(from = setdiff(nodes(net), receptors), to = receptor)
+             }) %>%
+  {do.call("rbind", .)} %>%
+  data.frame(stringsAsFactors = F) %>%
+  mutate(prob = .46875 * .1)
+prior_incoming <- lapply(receptors, 
+             function(receptor){
+               cbind(from = receptor, to = setdiff(nodes(net), receptors))
+             }) %>%
+  {do.call("rbind", .)} %>%
+  data.frame(stringsAsFactors = F) %>%
+  mutate(prob = .46875 * .9)
+hyper_prior <- rbind(receptor_bl, prior_no_incoming, prior_incoming)
+canonical_boot <- lapply(starting_nets, function(start_net){
+    tabu(rbn(net, 80), start = start_net, tabu = 50, 
+         prior = "cs", beta = hyper_prior, score = "bde", iss = 40)
+  }) %>%
+  custom.strength(nodes(net), cpdag = FALSE)
+canonical_prior <- mutate(canonical_boot, 
+                        prob = strength * direction,
+                        prob = ifelse(prob == 1, 1 - .Machine$double.eps * 100, prob ),
+                        prob = ifelse(prob == 0,  .Machine$double.eps * 100, prob)) %>%
+  select(from, to, prob)
+```
+
+Sanity check, these should not be the same.
+
+```{r}
+data_prior %>%
+  mutate(canonical_prob = canonical_prior[,"prob"],
+         edge = arcs2names(., directed_edges = F),
+         valid = ifelse(edge %in% arcs2names(arcs(net), directed_edges = F), "T", "F"),
+         prior = ifelse(edge %in% prior_edges, "prior", "not")
+  ) %>%
+  ggplot(aes(x = prob, y = canonical_prob, 
+             colour = valid, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("data-only prior") + 
+  ylab("canonical prior") +  
+  ggtitle("Comparison of edge probabilities in between priors")
+```
+
+Some (though not all) of the edges directly affected by the canonical information have lower probability in the case of the canonical prior.  Other edges have more or less probability.
+
+### Comparison of inferred edges on intervention data.
+Let's compare to the case of stimulating 2 downstream proteins; ikk, mkk4, and erk12.  First is the case with no prior information.
+
+```{r}
+node_names <- nodes(net)
+starting_nets <- random.graph(node_names, 100, method = "ic-dag", burn.in = 100) 
+interventions <- c("ikk", "mkk4")
+i <- 0
+boot_no_canonical <- lapply(starting_nets, function(start_net){
+  i <<- i + 1
+  print(i)
+  .sim_data <- rbn_inhibition(net, 20, targets = interventions)
+  targets <- attr(.sim_data, "target")
+  exp_list <- lapply(node_names, function(nom) which(nom == targets))
+  names(exp_list) <- node_names
+  sim_net <- tabu(.sim_data, start = start_net, tabu = 50, score = "mbde",
+              exp = exp_list, prior = "cs", beta = data_prior, iss = 40)
+  ctsdag(sim_net, interventions)
+  }) %>%
+  custom.strength(node_names, cpdag = FALSE)
+```
+
+
+```{r}
+i <- 0
+boot_canonical <- lapply(starting_nets, function(start_net){
+  i <<- i + 1
+  print(i)
+  .sim_data <- rbn_inhibition(net, 20, targets = interventions)
+  targets <- attr(.sim_data, "target")
+  exp_list <- lapply(node_names, function(nom) which(nom == targets))
+  names(exp_list) <- node_names
+  sim_net <- tabu(.sim_data, start = start_net, tabu = 50, score = "mbde",
+              exp = exp_list, prior = "cs", beta = canonical_prior, iss = 40)
+  ctsdag(sim_net, interventions)
+  }) %>%
+  custom.strength(node_names, cpdag = FALSE)
+```
+
+Now in this case we are really rooting for less causal entropy:
+
+```{r}
+boot_no_canonical %>%
+  reduce_averaging %>%
+  mutate(entropy = orientation_entropy(.),
+         canonical_entropy = orientation_entropy(reduce_averaging(boot_canonical)),
+         edge = arcs2names(., directed_edges = F),
+         valid = ifelse(edge %in% arcs2names(arcs(net), directed_edges = F), "T", "F"),
+         type = ifelse(edge %in% prior_edges, "prior", "other"),
+         from_target = ifelse(from %in% interventions, TRUE, FALSE),
+         to_target = ifelse(to %in% interventions, TRUE, FALSE),
+         type = ifelse(from_target + to_target > 0, "oriented", type),
+         type = factor(type, levels = c("other", "prior", "oriented"))
+  ) %>%
+  ggplot(aes(x = entropy, y = canonical_entropy, 
+             colour = valid, shape = type)) +
+  geom_point() +
+  xlab("data-only prior") + 
+  ylab("canonical prior") +  
+  ylim(c(0, 1)) + 
+  xlim(c(0, 1)) +
+  ggtitle("Comparison of orientation entropy")
+```
+
+Hard to tell with entropy.  Maybe more of an S-curve in overall edge probability?
+
+```{r}
+boot_no_canonical %>%
+  mutate(prob = strength * direction,
+         canonical_prob = boot_canonical$strength * boot_canonical$direction,
+         edge = arcs2names(., directed_edges = F),
+         valid = ifelse(edge %in% arcs2names(arcs(net), directed_edges = F), "T", "F"),
+         type = ifelse(edge %in% prior_edges, "prior", "other"),
+         from_target = ifelse(from %in% interventions, TRUE, FALSE),
+         to_target = ifelse(to %in% interventions, TRUE, FALSE),
+         type = ifelse(from_target + to_target > 0, "oriented", type),
+         type = factor(type, levels = c("other", "prior", "oriented"))
+  ) %>%
+  ggplot(aes(x = prob, y = canonical_prob, 
+             colour = valid, shape = type)) +
+  geom_point() +
+  xlab("data-only edge prob") + 
+  ylab("canonical edge prob") +  
+  ggtitle("Comparison of edge probabilities in between priors")
+```
+
+Seems canonical information is improving specificity.
+
+
+```{r}
+plot_no_canonical <- boot_no_canonical %>%
+  reduce_averaging %>%
+  mutate(
+    edge = arcs2names(., directed_edges = F),
+    entropy = orientation_entropy(.),
+    valid = ifelse(edge %in% arcs2names(arcs(net), directed_edges = F), "T", "F"),
+    prior = ifelse(edge %in% prior_edges, "prior", "not")
+  ) %>%
+  select(-direction) 
+plot_canonical <- boot_canonical %>%
+  reduce_averaging %>%
+  mutate(
+    edge = arcs2names(., directed_edges = F),
+    entropy = orientation_entropy(.),
+    valid = plot_no_canonical$valid,
+    prior = plot_no_canonical$prior) %>%
+  select(-direction) 
+edge_id <- order(order(rowMeans(cbind(plot_no_canonical$strength,
+                                      plot_canonical$strength)))) 
+plot_no_canonical$edge_id <- edge_id
+plot_canonical$edge_id <- edge_id
+```
+
+Strength with no canonical knowledge.
+
+```{r}
+plot_no_canonical %>%
+  ggplot(aes(x = edge_id, y = strength, 
+             colour = valid, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Strength of inferred edges, no canonical knowledge prior")
+```
+
+Strength without canonical knowledge.
+
+```{r}
+plot_canonical %>%
+  ggplot(aes(x = edge_id, y = strength, 
+             colour = valid, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Strength of inferred edges, canonical knowledge prior")
+```
+
+Again, an improvement in specificity.
+
+Now orientation entropy without prior knowledge:
+
+```{r}
+plot_no_canonical %>%
+  ggplot(aes(x = edge_id, y = entropy, 
+             colour = valid, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ylim(c(0, 1))
+  ggtitle("Orientation entropy without prior knowledge")
+```
+
+```{r}
+plot_canonical %>%
+  ggplot(aes(x = edge_id, y = entropy, 
+             colour = valid, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ylim(c(0, 1)) +
+  ggtitle("Orientation entropy with prior knowledge")
+```
+
+Definately a decrease in orientation entorpy using this approach.  
+
+The approach is working.  Incoporating the canonical prior resulted in way less orientation entropy.  Now calculating an averaging L1 and average orientation.
+
+First, I create a list of combinations of interventions, which I will use to store values, and shorten the length of the simulation.
+
+```{r}
+node_names <- nodes(net)
+int_targets <- nodes(net)
+cbn <- NULL
+for(i in 1:(length(int_targets) - 1)){
+  cbn_list_names <- combn(int_targets, i) %>%
+    apply(., 2, list) %>%
+    lapply(unlist) %>%
+    sapply(function(item) paste0(sort(item), collapse="-"))
+  cbn_list <- lapply(cbn_list_names, function(l) list(entropy = NA, L1 = NA))
+  names(cbn_list) <- cbn_list_names
+  cbn <- c(cbn, cbn_list)
+}
+cbn <- c(cbn, list(list(entropy = NA, L1 = NA)))
+names(cbn)[length(cbn)] <- paste0(sort(int_targets), collapse = "-")
+
+################################################################################
+## Algo for calculating the ordering
+################################################################################
+.new_ordering <- function(ordering, starting_boot, starting_prior, .iss){
+  l1s <- l1_error(net, starting_boot)
+  entropies <- sum(orientation_entropy(starting_boot))
+  for(i in 1:length(ordering)){
+    interventions <- ordering[1:i]
+    sub_order_name <- paste0(sort(interventions), collapse = "-")
+    print(sub_order_name)
+    # To avoid repeats, only compute new entropies. This should take time
+    prior_entropy <- cbn[[sub_order_name]]$entropy
+    prior_l1 <- cbn[[sub_order_name]]$L1
+    if(is.na(prior_entropy[[1]])){
+      int_dex <- which(node_names %in% interventions)
+      boot_i <- lapply(starting_nets, function(start_net){
+        .obs_data <- rbn_fixed(net, 5)
+        .sim_data <- rbn_inhibition(net, 5, targets = interventions)
+        targets <- c(rep("obs", nrow(.obs_data)), attr(.sim_data, "target"))
+        exp_list <- lapply(node_names, function(nom) which(nom == targets))
+        names(exp_list) <- node_names
+        .data <- rbind(.obs_data, .sim_data)
+        sim_net <- tabu(.data, start = start_net, tabu = 50, score = "mbde",
+              exp = exp_list, prior = "cs", beta = starting_prior, iss = 40)
+        ctsdag(sim_net, interventions)
+      }) %>%
+        custom.strength(node_names, cpdag = FALSE)
+      causal_entropy_i <- sum(orientation_entropy(boot_i))
+      l1_i <- l1_error(net, boot_i)
+      cbn[[sub_order_name]]$entropy <<- causal_entropy_i
+      cbn[[sub_order_name]]$L1 <<- l1_i
+    } else {
+      message("used prior values")
+      causal_entropy_i <- prior_entropy
+      l1_i <- prior_l1
+    }
+    message("L1 = ", round(l1_i, 4))
+    message("entropy = ", round(causal_entropy_i, 4))
+    l1s <- c(l1s, l1_i)
+    entropies <- c(entropies, causal_entropy_i)
+  }
+  names(entropies) <- c("start", ordering)
+  names(l1s) <- c("start", ordering)
+  list(entropies = entropies, l1s = l1s)
+}
+
+################################################################################
+## Simulation with just observational data
+################################################################################
+random_orderings <- lapply(1:30, function(i){
+  sample(int_targets)
+})
+starting_nets <- random.graph(node_names, 30, method = "ic-dag", burn.in = 100) 
+random_ordering_data_prior_results <- lapply(random_orderings, .new_ordering,
+                                      starting_boot = data_boot,
+                                      starting_prior = data_prior)
+save(random_ordering_data_prior_results, file = "dream_random_order_data_results.Rdata")
+cbn <- NULL
+for(i in 1:(length(int_targets) - 1)){
+  cbn_list_names <- combn(int_targets, i) %>%
+    apply(., 2, list) %>%
+    lapply(unlist) %>%
+    sapply(function(item) paste0(sort(item), collapse="-"))
+  cbn_list <- lapply(cbn_list_names, function(l) list(entropy = NA, L1 = NA))
+  names(cbn_list) <- cbn_list_names
+  cbn <- c(cbn, cbn_list)
+}
+cbn <- c(cbn, list(list(entropy = NA, L1 = NA)))
+names(cbn)[length(cbn)] <- paste0(sort(int_targets), collapse = "-")
+random_ordering_canonical_prior_results <- lapply(random_orderings, .new_ordering,
+                                      starting_boot = canonical_boot,
+                                      starting_prior = canonical_prior)
+save(random_ordering_canonical_prior_results, file = "dream_random_ordering_canonical_results.Rdata")
+
+y1 <-lapply(random_ordering_data_prior_results, function(item){
+  as.numeric(item$l1)
+}) %>%
+  {do.call("rbind", .)} %>%
+  colMeans
+
+y2 <-lapply(random_ordering_canonical_prior_results, function(item){
+  as.numeric(item$l1)
+}) %>%
+  {do.call("rbind", .)} %>%
+  colMeans
+```
+
+```{r}
+################################################################################
+## Algo for the sim.
+################################################################################
+obs_data <- rbn(net, 80)
+selected <- NULL
+entropies <- NULL
+info_gains <- NULL
+all_results <- list()
+do_sim <- function(strength_df, algo_args = NULL, base_wl = NULL){
+  candidates <- int_targets
+  strength_df$entropy <- orientation_entropy(strength_df)
+  #p_vals <- NULL
+  while(length(candidates) > 0){
+    sim_results <- select_next_inhibition(obs_data, strength_df, selected,
+                                          candidates, algo_args = algo_args,
+                                          base_wl = base_wl, k = 30, debug = TRUE)
+    next_inh <- sim_results$top_candidate
+    next_entropy <- sim_results$predicted_entropy
+    next_gain <- sim_results$predicted_gain
+    entropies <<- c(entropies, next_entropy)
+    info_gains <<- c(info_gains, next_gain)
+    message("next_gain: ", round(next_gain, 4))
+    candidates <- setdiff(candidates, next_inh)
+    selected <<- c(selected, next_inh)
+    all_results <<- c(all_results, sim_results)
+    names(all_results)[length(all_results)] <- paste0(selected, collapse = "-")
+    #message("null dist when ", selected, " is selected looks like ",
+    #        paste(round(head(null_dist), 4), collapse = ", "))
+    #print(p_val)
+    print(selected)
+    if(length(candidates) == 0) break
+  }
+  list(selected = selected, entropies = entropies,
+       info_gains = info_gains, all_results = all_results)
+}
+################################################################################
+## Simulation with just observational data
+################################################################################
+cl <- makeCluster(4)
+algo_args <- list(score = "bde", prior = "cs", beta = canonical_prior, tabu = 50, whitelist = NULL, iss = 40)
+npr_time <- system.time(canonical_result <- do_sim(canonical_boot, algo_args = algo_args))
+save(canonical_result, file = "canonical_prior_result_5-1-16_iss40.Rdata")
+```

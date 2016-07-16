@@ -1,0 +1,445 @@
+---
+title: "DREAM 4 Data Analysis"
+author: "Vignette Author"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, message=FALSE}
+library(CellNOptR)
+library(CNORode)
+library(dplyr)
+library(tidyr)
+library(bninfo)
+library(artemis)
+```
+
+## Objectives
+
+* Obtain contrast of strength and direction with prior edges
+* Obtain a decline of L1 error
+* Obtain a decline of causal entropy
+
+The following works with the compressed DREAM 4 model.
+
+```{r}
+data_file <- system.file("extdata/datasets", "MD-LiverDREAM.csv",
+                         package = "artemis")
+model_file <- system.file("extdata/models", "PKN-LiverDREAM.sif", 
+                          package = "artemis")
+cnolist <- CNOlist(data_file)
+model <- readSIF(model_file) # Need to expand possible and relationships.
+mod_model <- indexFinder(cnolist, model) %>%
+  {compressModel(model,.)}
+plotModel(mod_model, cnolist)
+```
+
+Use an EM-ish approach to replace the missing values.
+```{r}
+library(neuralnet)
+.data <- getSignals(cnolist)[["30"]]  %>%
+  data.frame %>%
+  {cbind(getStimuli(cnolist), .)}
+p38_NAs <- is.na(.data$p38)
+mek12_NAs <- is.na(.data$mek12)
+.sim_data <- .data
+fit <- neuralnet(mek12 ~ igf1+il1a+tgfa+tnfa+akt+erk12+ikb+jnk12+hsp27,
+              data = na.omit(.sim_data[, -9]), hidden = 3, err.fct="sse", 
+              linear.output =FALSE, likelihood = TRUE)
+.sim_data$mek12[mek12_NAs] <- neuralnet::compute(fit, .sim_data[mek12_NAs, -c(9, 11)]) %$%
+  net.result %>%
+  as.numeric
+for(i in 1:10){
+  p38_trainer <- .sim_data[!p38_NAs,]
+  p38_predictor <- .sim_data[p38_NAs, -9]
+  p38_new_fit <- neuralnet(p38 ~ igf1+il1a+tgfa+tnfa+akt+erk12+ikb+jnk12+hsp27+mek12,
+                data = p38_trainer, hidden = 5, err.fct="sse", 
+                linear.output =FALSE, likelihood = TRUE) 
+  p38_new <-  neuralnet::compute(p38_new_fit, p38_predictor) %$%
+    net.result %>%
+    as.numeric
+  print(round(p38_new, 4))
+  .sim_data$p38[p38_NAs] <- p38_new
+  mek12_trainer <- .sim_data[!mek12_NAs, ]
+  mek12_predictor <- .sim_data[mek12_NAs, -11]
+  mek12_new_fit <- neuralnet(mek12 ~ igf1+il1a+tgfa+tnfa+akt+erk12+ikb+jnk12+hsp27+p38,
+                data = mek12_trainer, hidden = 5, err.fct="sse", 
+                linear.output =FALSE, likelihood = TRUE) 
+  mek12_new <- neuralnet::compute(mek12_new_fit, mek12_predictor) %$%
+    net.result %>%
+    as.numeric
+  #print(mek12_new)
+  .sim_data$mek12[mek12_NAs] <- mek12_new
+}  
+cnolist2 <- cnolist
+detach(package:neuralnet)
+detach(package:MASS)
+base_mat <- cnolist2@signals[["0"]]
+base_mat[is.na(base_mat)] <- 0
+cnolist2@signals[["0"]] <- base_mat
+cnolist2@signals[["30"]] <- .sim_data %>% 
+  select(akt, erk12, ikb, jnk12, p38, hsp27, mek12) %>%
+  as.matrix
+```
+
+I coerce the values into a binary "on/off" variable using the ODE fit
+
+```{r}
+expanded_mod <- expandGates(mod_model, maxInputsPerGate=2)  #enable AND gates for better CPDs
+ode_parameters <- expanded_mod %>%
+  createLBodeContPars(LB_n = 1, LB_k = 0.1,
+                      LB_tau = 0.01, UB_n = 5, UB_k = 0.9, 
+                      UB_tau = 10, default_n = 3, default_k = 0.9, 
+                      default_tau = 1, opt_n = TRUE, opt_k = TRUE,
+                      opt_tau = TRUE, random = FALSE)
+model_sim <- plotLBodeModelSim(cnolist2, expanded_mod, ode_parameters, 
+                               timeSignals=seq(0,30,0.5))
+inhib_mat <- getInhibitors(cnolist)
+targets <- colnames(inhib_mat)
+inhibs <- paste0("inh_", targets)
+colnames(inhib_mat) <- inhibs
+.data <- model_sim[[length(model_sim)]]  %>%
+  apply(2, round) %>%
+  data.frame %>%
+  set_names(mod_model$namesSpecies) %>%  
+  select(-tgfa, -igf1, -tnfa, -il1a) %>%
+  {cbind(inhib_mat, .)} %>%
+  {cbind(getStimuli(cnolist), .)} %>%
+  filter(!is.na(map3k7)) %>%
+  lapply(ordered) %>%
+  data.frame 
+gt <- empty.graph(setdiff(names(.data), inhibs))
+arcs(gt) <-  model2sif(mod_model)[, c(1, 3)] %>%
+  set_colnames(c("from", "to"))
+gt_inh <- empty.graph(names(.data))
+arcs(gt_inh) <- arcs(gt) %>%
+  rbind(cbind(from = inhibs, to = targets))
+net <- rbn(gt_inh, n = 10000, data = .data, fit = "bayes", iss = 1) %>%
+  select(-inh_ikk, -inh_mek12, -inh_pi3k, -inh_p38) %>% 
+  bn.fit(gt, data = .)
+save(net, file = "inst/extdata/robjects/dream_net.rda")
+```
+
+Next I generate strength and edge orientation diagrams.  First I treat the distribution of all proteins as random.  Any causal information will be a product of v-structures.
+
+Then I introduce the pathway knowledge that igf1, il1a, tgfa, and tnfa are receptors.  In the first case I suppose that there is low probability that these have incoming egdes, prior probability of these nodes having incoming edges is near 0.  In the second, I suppose I know the outcoming edges with near probability.  In call cases, I assume these are random.
+
+```{r}
+receptors <- c("igf1", "il1a", "tgfa", "tnfa")
+bl <- lapply(receptors, 
+             function(receptor){
+               cbind(from = setdiff(nodes(net), receptor), to = receptor)
+             }) %>%
+             {do.call("rbind", .)} 
+wl <- arcs(net)[1:10, ]
+prior_edges <-  arcs2names(wl, directed = F)
+starting_nets <- random.graph(nodes(net), 500, method = "ic-dag", burn.in = 100) 
+boot <- lapply(starting_nets, function(start_net){
+    tabu(rbn(net, 80), start = start_net, tabu = 50, 
+                    score = "bde", iss = 1)
+  }) %>%
+  custom.strength(nodes(net), cpdag = FALSE) # Keep it false for now
+plot_no_prior <- boot %>%
+  reduce_averaging %>%
+  mutate(
+    edge = arcs2names(., directed_edges = F),
+    entropy = orientation_entropy(.),
+    detected = ifelse(edge %in% arcs2names(arcs(net), directed_edges = F), "T", "F"),
+    prior = ifelse(edge %in% prior_edges, "prior", "not")
+  ) %>%
+  select(-direction) 
+```
+
+Now introducing the prior information:
+
+```{r}
+bl_arcs <- apply(bl, 1, paste0, collapse = "->")
+bl_nets <- lapply(starting_nets, function(rand_net){
+    new_net <- empty.graph(nodes(rand_net))
+    new_arcs <- rand_net %>%
+      arcs %>%
+      data.frame %>%
+      mutate(edges = arcs2names(arcs(rand_net), directed = TRUE)) %>%
+      filter(!edges %in% bl_arcs) %>%
+      select(from, to) %>%
+      as.matrix
+    arcs(new_net) <- new_arcs
+    new_net
+  })
+boot_bl <- lapply(bl_nets, function(start_net){
+    tabu(rbn(net, 80), start = start_net, tabu = 50, 
+         blacklist = bl, score = "bde", iss = 1)
+  }) %>%
+  custom.strength(nodes(net), cpdag = FALSE)
+plot_bl <- boot_bl %>%
+  reduce_averaging %>%
+  mutate(
+    edge = arcs2names(., directed_edges = F),
+    entropy = orientation_entropy(.),
+    detected = plot_no_prior$detected,
+    prior = plot_no_prior$prior) %>%
+  select(-direction) 
+```
+
+```{r}
+wl_nets <-lapply(bl_nets, function(rand_net){
+  new_net <- empty.graph(nodes(rand_net))
+  # use suppressWarnings to avoid warnings about duplicate arcs
+  new_net <- suppressWarnings(`arcs<-`(new_net, value = rbind(arcs(rand_net), wl)))
+  new_net
+})
+boot_wl <- lapply(wl_nets, function(start_net){
+    tabu(rbn(net, 80), start = start_net, tabu = 50, 
+         blacklist = bl, whitelist = wl,
+         score = "bde", iss = 1)
+  }) %>%
+  custom.strength(nodes(net), cpdag = FALSE)
+plot_wl <- boot_wl %>%
+  reduce_averaging %>%
+  mutate(
+    edge = arcs2names(., directed_edges = F),
+    entropy = orientation_entropy(.),
+    detected = plot_no_prior$detected,
+    prior = plot_no_prior$prior
+  ) %>%
+  select(-direction) 
+edge_id <- order(order(rowMeans(cbind(plot_no_prior$strength,
+                                      plot_bl$strength,
+                                      plot_wl$strength)))) 
+plot_no_prior$edge_id <- edge_id
+plot_bl$edge_id <- edge_id
+plot_wl$edge_id <- edge_id
+```
+
+
+Strength without prior knowledge
+```{r}
+plot_no_prior %>%
+  ggplot(aes(x = edge_id, y = strength, 
+             colour = detected, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Strength of inferred edges, no prior knowledge")
+```
+
+Strength with low probability on incoming links to receptors.
+```{r}
+plot_bl %>%
+  ggplot(aes(x = edge_id, y = strength, 
+             colour = detected, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Strength of inferred edges with low prob receptor edges")
+```
+
+Strength with high probability on outgoing links from receptors.
+```{r}
+plot_wl %>%
+  ggplot(aes(x = edge_id, y = strength, 
+             colour = detected, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Strength of inferred edges with high prob receptor edges")
+```
+
+Now orientation entropy without prior knowledge:
+
+```{r}
+plot_no_prior %>%
+  ggplot(aes(x = edge_id, y = entropy, 
+             colour = detected, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Orientation entropy without prior knowledge")
+```
+
+With low prob receptor edges:
+
+```{r}
+plot_bl %>%
+  ggplot(aes(x = edge_id, y = entropy, 
+             colour = detected, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Orientation entropy with low prob receptor edges")
+```
+
+```{r}
+plot_wl %>%
+  ggplot(aes(x = edge_id, y = entropy, 
+             colour = detected, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Orientation entropy with high prob receptor edges")
+```
+
+# Repeating the analysis using prior probabilities instead of blacklist
+
+```{r}
+receptors <- c("igf1", "il1a", "tgfa", "tnfa")
+bl <- lapply(receptors, 
+             function(receptor){
+               cbind(from = setdiff(nodes(net), receptor), to = receptor)
+             }) %>%
+             {do.call("rbind", .)} 
+wl <- arcs(net)[1:10, ]
+prior_edges <-  arcs2names(wl, directed = F)
+starting_nets <- random.graph(nodes(net), 500, method = "ic-dag", burn.in = 100) 
+boot <- lapply(starting_nets, function(start_net){
+    tabu(rbn(net, 80), start = start_net, tabu = 50, 
+                    score = "bde", iss = 40)
+  }) %>%
+  custom.strength(nodes(net), cpdag = FALSE) # Keep it false for now
+plot_no_prior <- boot %>%
+  reduce_averaging %>%
+  mutate(
+    edge = arcs2names(., directed_edges = F),
+    entropy = orientation_entropy(.),
+    detected = ifelse(edge %in% arcs2names(arcs(net), directed_edges = F), "T", "F"),
+    prior = ifelse(edge %in% prior_edges, "prior", "not")
+  ) %>%
+  select(-direction) 
+```
+
+Now introducing the prior information:
+
+```{r}
+receptor_bl <- lapply(receptors,
+                      function(receptor){
+                        cbind(from = receptor, to = setdiff(receptors, receptor))
+                      }) %>%
+  {do.call("rbind", .)} %>%
+  data.frame(stringsAsFactors = F) %>%
+  mutate(prob = .Machine$double.eps * 100)
+prior_no_incoming <- lapply(receptors, 
+             function(receptor){
+               cbind(from = setdiff(nodes(net), receptors), to = receptor)
+             }) %>%
+  {do.call("rbind", .)} %>%
+  data.frame(stringsAsFactors = F) %>%
+  mutate(prob = .46875 * .1)
+prior_incoming <- lapply(receptors, 
+             function(receptor){
+               cbind(from = receptor, to = setdiff(nodes(net), receptors))
+             }) %>%
+  {do.call("rbind", .)} %>%
+  data.frame(stringsAsFactors = F) %>%
+  mutate(prob = .46875 * .9)
+
+bl_prior <- rbind(receptor_bl, prior_no_incoming, prior_incoming) 
+boot_bl <- lapply(starting_nets, function(start_net){
+    tabu(rbn(net, 80), start = start_net, tabu = 50, 
+         prior = "cs", beta = bl_prior, score = "bde", iss = 40)
+  }) %>%
+  custom.strength(nodes(net), cpdag = FALSE)
+plot_bl <- boot_bl %>%
+  reduce_averaging %>%
+  mutate(
+    edge = arcs2names(., directed_edges = F),
+    entropy = orientation_entropy(.),
+    detected = plot_no_prior$detected,
+    prior = plot_no_prior$prior) %>%
+  select(-direction) 
+```
+
+```{r}
+prior_outgoing <- wl %>%
+  data.frame %>%
+  mutate(prob = .5 * .9)
+full_prior <- rbind(receptor_bl, prior_no_incoming, prior_outgoing) 
+boot_wl <- lapply(starting_nets, function(start_net){
+    tabu(rbn(net, 80), start = start_net, tabu = 50, 
+         prior = "cs", beta = full_prior,
+         score = "bde", iss = 80)
+  }) %>%
+  custom.strength(nodes(net), cpdag = FALSE)
+plot_wl <- boot_wl %>%
+  reduce_averaging %>%
+  mutate(
+    edge = arcs2names(., directed_edges = F),
+    entropy = orientation_entropy(.),
+    detected = plot_no_prior$detected,
+    prior = plot_no_prior$prior
+  ) %>%
+  select(-direction) 
+edge_id <- order(order(rowMeans(cbind(plot_no_prior$strength,
+                                      plot_bl$strength))))#,
+#                                      plot_wl$strength)))) 
+plot_no_prior$edge_id <- edge_id
+plot_bl$edge_id <- edge_id
+plot_wl$edge_id <- edge_id
+```
+
+
+
+Strength without prior knowledge
+```{r}
+plot_no_prior %>%
+  ggplot(aes(x = edge_id, y = strength, 
+             colour = detected, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Strength of inferred edges, no prior knowledge")
+```
+
+
+
+Strength with low probability on incoming links to receptors.
+```{r}
+plot_bl %>%
+  ggplot(aes(x = edge_id, y = strength, 
+             colour = detected, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Strength of inferred edges with low prob receptor edges")
+```
+
+Strength with high probability on outgoing links from receptors.
+```{r}
+plot_wl %>%
+  ggplot(aes(x = edge_id, y = strength, 
+             colour = detected, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Strength of inferred edges with high prob receptor edges")
+```
+
+Now orientation entropy without prior knowledge:
+
+```{r}
+plot_no_prior %>%
+  ggplot(aes(x = edge_id, y = entropy, 
+             colour = detected, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Orientation entropy without prior knowledge")
+```
+
+With low prob receptor edges:
+
+```{r}
+plot_bl %>%
+  ggplot(aes(x = edge_id, y = entropy, 
+             colour = detected, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Orientation entropy with low prob receptor edges")
+```
+
+```{r}
+plot_wl %>%
+  ggplot(aes(x = edge_id, y = entropy, 
+             colour = detected, shape = prior, size = prior)) +
+  geom_point() +
+  xlab("edge id") + 
+  ggtitle("Orientation entropy with high prob receptor edges")
+```
+
+
+
+
+

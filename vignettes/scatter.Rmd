@@ -16,6 +16,7 @@ library(tidyr)
 library(dplyr)
 library(magrittr)
 library(parallel)
+library(CNORode)
 ```
 
 What are the pairwise relationships between the features in the type of data that CellNOpt works with?
@@ -56,7 +57,6 @@ For the most immediately downstream regulations, the plots look as I expect.  Fu
 I will try some preliminary Bayesian Network modeling and see how well I might reconstruction the network.  With few parameters I try a logistic transform and model with a Gaussian.  I will also blacklist any incoming edges to the receptors, for some basic direction coersion.
 
 ```{r}
-library(bnlearn)
 nodes <- c("Akt", "Hsp27", "NFkB", "Erk", "p90RSK", "Jnk", "cJun", "stim_TNFa", "stim_EGF")
 receptors <- c("stim_TNFa", "stim_EGF")
 bl <- rbind(cbind(setdiff(nodes, receptors[1]),receptors[1]),
@@ -176,7 +176,7 @@ Note, the above Bayes fit introduces not a small amount of entropy to the CPDs. 
 
 I am looking for three figures:
 
-1. One that show improvement in average causal entropy after each subsequent experiment.
+1. One that show improvement in average causal entropy after each subsequent experiment, compared to random.
 2. One that shows improvement of individual edge strengths upon incorporating prior data.
 3. One that shows improvement of individual causal entropies upon incorporating prior data.
 
@@ -232,8 +232,8 @@ boot_big <- rbn(net, 300000) %>%
 save(boot_big, file = "inst/extdata/robjects/toy_model_boot_300K.Rdata")
 ```
 
-```{r}
-system.file("/extdata/robjects/toy_model_boot_300K.Rdata")
+```{r, echo= FALSE}
+load(system.file("/extdata/robjects/", "toy_model_boot_300K.Rdata", package="artemis"))
 ```
 
 ```{r}
@@ -281,7 +281,7 @@ plot_data %>%
   filter(set == "small") %>%
   ggplot(aes(x = index_big, y = c_entropy, colour = validation)) +
   geom_point() +
-  ggtitle("Dataset simulated with 300K points")
+  ggtitle("Orientation entropy on smaller dataset")
 ```
 
 This is what I expected.  The edges I care about are the ones with the most entropy.  Now in the big data case, I expect the same amount of causal entropy.
@@ -291,7 +291,7 @@ plot_data %>%
   filter(set == "big") %>%
   ggplot(aes(x = index_big, y = c_entropy, colour = validation)) +
   geom_point() +
-  ggtitle("Dataset simulated with 300K points")
+  ggtitle("Orientation entropy on dataset simulated with 300K points")
 ```
 
 I didn't work!  Causal entropy is near 0!  
@@ -327,7 +327,7 @@ for(i in 1:length(change1)){
 change1
 ```
 
-All 0s as expected.  Despite resampling I always get the same network.
+All 0s as expected.  Despite resampling I always get the same network.  Trying now with random starting networks.
 
 ```{r}
 bl_arcs <- apply(bl, 1, paste0, collapse = "->")
@@ -396,5 +396,92 @@ If using mbde
 
 If using intervention nodes (softer than mbde), same as before, except for step 1.  
 
-I am going to stop here.  Rather than simulating, perhaps I could use some sort of enumeration.  For example, if Mek--Erk is fixed left to right assign a 1, if right to left assign 0, if variable assign .5?  I think this is something akin to what Scutari does.  
+I implemented this algorithm in bnlearn as the algorith ctsdag.  Trying again, using the ctsdag function to imply EGF and TNFa are fixed given the blacklist, not unlike in signalgraph.
+
+First a test of concept:
+
+```{r}
+sim_net <- tabu(rbn(net, 1000), tabu = 50, blacklist = bl, score = "bde", iss = 1)
+graphviz.plot(sim_net)
+graphviz.plot(ctsdag(sim_net, c("EGF", "TNFa")))
+```
+
+Interesting, making the receptors non-random essentially enforces downstream orientation. In fact if the algorithm had detected the link to PI3K, then it would be fully specified with just the signaling treatments.  I realize now I was wrong with my treatment of EGF and TNFa as random, and with suggesting in the manuscript stimulus that targets individual receptors are not targeted.  I also see that random graphs are the way to get variation.  With a white list, we will just have to use my Barabasi game approach - I can think of it as a way of incorporating network motif distribution information into the prior.  For now, I'll have to work with small numbers.  No super big stuff with big strength.
+
+What I wanted to show was that increasing the amount of data woundn't resolve causal entropy.  What I have learned is that if strengths are perfect (which would happen with large data and perfect faithfulnes), then you still have causal uncertainty because you would have a ts-equivalence class.  In the case of the toy network however, the ts-equivalence class is perfectly resolved.
+
+## Round 2:  Smaller sample sizes so strength doesn't all go to 0
+
+*As the number of cells increases, entropy in strength decreases.  False positives go down, true positives go up.*
+
+```{r}
+starting_nets <- random.graph(nodes(net), 200, method = "ic-dag", burn.in = 100) %>%
+  lapply(function(rand_net){
+    new_net <- empty.graph(nodes(rand_net))
+    new_arcs <- rand_net %>%
+      arcs %>%
+      data.frame %>%
+      mutate(edges = arcs2names(arcs(rand_net), directed = TRUE)) %>%
+      filter(!edges %in% bl_arcs) %>%
+      select(from, to) %>%
+      as.matrix
+    arcs(new_net) <- new_arcs
+    new_net
+  })
+boot_small <- lapply(starting_nets, function(start_net){
+    sim_net <- tabu(rbn(net, 30), start = start_net, tabu = 50, 
+                    blacklist = bl, score = "bde", iss = 1)
+    ctsdag(sim_net, c("EGF", "TNFa"))
+  }) %>%
+  custom.strength(nodes(net), cpdag = FALSE)
+boot_big <- lapply(starting_nets, function(start_net){
+    sim_net <- tabu(rbn(net, 300), start = start_net, tabu = 50, 
+                    blacklist = bl, score = "bde", iss = 1)
+    ctsdag(sim_net, c("EGF", "TNFa"))
+  }) %>%
+  custom.strength(nodes(net), cpdag = FALSE)
+plot_data <- data.frame(edges = arcs2names(boot_small, directed_edges = F),
+                        small = boot_small$strength,
+                        big = boot_big$strength) %>%
+  gather(set, strength, -edges) %>%
+  mutate(validation = ifelse(edges %in% arcs2names(arcs(net), 
+                                                   directed_edges = F), "T", "F"),
+         index_small = rep(order(order(strength[set == "small"])), 2),
+         index_big = rep(order(order(strength[set == "big"])), 2))
+```
+```{r}
+plot_data %>%
+  filter(set == "small") %>%
+  ggplot(aes(x = index_small, y = strength, colour = validation)) +
+  geom_point() +
+  ggtitle("Dataset simulated with small sample")
+```
+```{r}
+plot_data %>%
+  filter(set == "big") %>%
+  ggplot(aes(x = index_big, y = strength, colour = validation)) +
+  geom_point() +
+  ggtitle("Dataset simulated with big sample")
+```
+
+
+
+```{r}
+plot_data <- data.frame(edges = arcs2names(boot_rbn, directed_edges = F),
+                        small = orientation_entropy(boot_rbn),
+                        big = orientation_entropy(boot_big)) %>%
+  gather(set, c_entropy, -edges) %>%
+  mutate(validation = ifelse(edges %in% arcs2names(arcs(net), directed_edges = F), "T", "F"),
+         index_small = rep(order(order(c_entropy[set == "small"])), 2),
+         index_big = rep(order(order(c_entropy[set == "big"])), 2))
+```
+
+```{r}
+plot_data %>%
+  filter(set == "small") %>%
+  ggplot(aes(x = index_big, y = c_entropy, colour = validation)) +
+  geom_point() +
+  ggtitle("Orientation entropy on smaller dataset")
+```
+
 
